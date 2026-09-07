@@ -126,6 +126,8 @@ gather_answers() {
 
   INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows SSH and ICMP in, drops everything else)" n)
 
+  HARDEN_BOOTLINE=$(ask_yn "Harden the kernel command line? (lockdown=confidentiality, init_on_alloc, slab_nomerge, ...)" n)
+
   AUTO_REBOOT=$(ask_yn "Let unattended-upgrades reboot automatically at 03:00 when needed?" y)
 
   while true; do
@@ -198,7 +200,12 @@ step_ssh_keys() {
 
 step_sshd() {
   log "Hardening sshd"
-  if install_file /etc/ssh/sshd_config.d/00-hardening.conf 0644 <<'EOF'
+  if [[ ! -f /etc/ssh/ssh_host_ed25519_key ]]; then
+    ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ""
+  fi
+  # sshd keeps the first value it reads, so a lower-numbered file can override
+  # this baseline.
+  if install_file /etc/ssh/sshd_config.d/99-hardening.conf 0644 <<'EOF'
 # Managed by debian-setup; local edits are overwritten on the next run.
 PermitRootLogin no
 PasswordAuthentication no
@@ -210,10 +217,19 @@ PubkeyAuthentication yes
 AuthenticationMethods publickey
 LoginGraceTime 30
 MaxAuthTries 3
+KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,gss-curve25519-sha256-
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com
+HostKeyAlgorithms sk-ssh-ed25519-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+RequiredRSASize 3072
+CASignatureAlgorithms sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+GSSAPIKexAlgorithms gss-curve25519-sha256-
+HostbasedAcceptedAlgorithms sk-ssh-ed25519-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-256
+PubkeyAcceptedAlgorithms sk-ssh-ed25519-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-256
 EOF
   then
     if ! sshd -t; then
-      rm -f /etc/ssh/sshd_config.d/00-hardening.conf
+      rm -f /etc/ssh/sshd_config.d/99-hardening.conf
       die "sshd rejected the new configuration, so it was removed again"
     fi
     systemctl try-reload-or-restart ssh
@@ -280,6 +296,25 @@ EOF
   fi
 }
 
+step_bootline() {
+  log "Hardening the kernel command line"
+  if ! command -v update-grub >/dev/null; then
+    warn "update-grub not found, skipped the kernel command line hardening"
+    return 0
+  fi
+  # grub-mkconfig sources /etc/default/grub and then /etc/default/grub.d/*.cfg,
+  # so this appends to whatever the installer put in GRUB_CMDLINE_LINUX.
+  # shellcheck disable=SC2016
+  if install_file /etc/default/grub.d/00-baseline.cfg 0644 <<'EOF'
+# Managed by debian-setup; local edits are overwritten on the next run.
+GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX mitigations=auto lockdown=confidentiality randomize_kstack_offset=on init_on_alloc=1 slab_nomerge apparmor=1"
+EOF
+  then
+    update-grub
+    BOOTLINE_CHANGED=y
+  fi
+}
+
 step_unattended_upgrades() {
   log "Configuring unattended upgrades"
   install_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF' || true
@@ -310,7 +345,9 @@ EOF
 
 step_sysctl() {
   log "Configuring sysctl"
-  install_file /etc/sysctl.d/42-local.conf 0644 <<'EOF' || true
+  # sysctl.d applies files in order and later ones win, so a higher-numbered
+  # file can override this baseline.
+  install_file /etc/sysctl.d/00-baseline.conf 0644 <<'EOF' || true
 # Managed by debian-setup; local edits are overwritten on the next run.
 # kernel.modules_disabled=1 is set via systemd unit
 net.ipv4.tcp_ecn=1
@@ -424,6 +461,9 @@ finish() {
   if [[ -f /run/reboot-required ]]; then
     warn "a reboot is required to finish applying updates"
   fi
+  if [[ ${BOOTLINE_CHANGED:-n} == y ]]; then
+    warn "a reboot is required to apply the new kernel command line"
+  fi
 }
 
 main() {
@@ -442,6 +482,9 @@ main() {
   fi
   if [[ $INSTALL_FIREWALL == y ]]; then
     step_firewall
+  fi
+  if [[ $HARDEN_BOOTLINE == y ]]; then
+    step_bootline
   fi
   step_unattended_upgrades
   step_sysctl

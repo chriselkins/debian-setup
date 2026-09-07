@@ -16,6 +16,7 @@ It asks a few questions up front and then runs unattended:
   username, password and server URL)
 - which users get my SSH key (defaults to the regular users on the box)
 - whether to enable the nftables firewall (default no)
+- whether to harden the kernel command line (default no)
 - whether unattended-upgrades may reboot automatically at 03:00
 - journald `SystemMaxUse` and `MaxRetentionSec` (defaults 16G and 30day)
 
@@ -25,7 +26,7 @@ It asks a few questions up front and then runs unattended:
 2. Enables `systemd-timesyncd`.
 3. Optionally downloads the Comet Backup client and installs it with apt.
 4. Adds my SSH key to `~/.ssh/authorized_keys` for the chosen users.
-5. Hardens sshd through `/etc/ssh/sshd_config.d/00-hardening.conf`: key-only
+5. Hardens sshd through `/etc/ssh/sshd_config.d/99-hardening.conf`: key-only
    authentication, no root login. If no non-root user holds the key this step
    warns and is skipped unless confirmed, so I cannot lock myself out.
 6. Optionally installs nftables with `/etc/nftables.conf`: input and forward
@@ -34,16 +35,20 @@ It asks a few questions up front and then runs unattended:
    source address. `/etc/modules-load.d/firewall.conf` loads the nftables
    modules at boot so the ruleset can be reloaded after module loading is
    locked.
-7. Enables unattended-upgrades and installs `/etc/apt/apt.conf.d/52unattended-upgrades-local`.
-8. Installs `/etc/sysctl.d/42-local.conf` (BBR and fq, kernel hardening such
+7. Optionally installs `/etc/default/grub.d/00-baseline.cfg`, which appends
+   `mitigations=auto lockdown=confidentiality randomize_kstack_offset=on
+   init_on_alloc=1 slab_nomerge apparmor=1` to `GRUB_CMDLINE_LINUX`, and runs
+   `update-grub`. Takes effect from the next reboot.
+8. Enables unattended-upgrades and installs `/etc/apt/apt.conf.d/52unattended-upgrades-local`.
+9. Installs `/etc/sysctl.d/00-baseline.conf` (BBR and fq, kernel hardening such
    as restricted ptrace, kptr, dmesg, BPF and kexec, ASLR maximums, redirect and
    source-route hardening, protected fifos, regular files and links) and
    `/etc/modules-load.d/network-performance.conf` so `tcp_bbr` and `sch_fq` are
    loaded at boot.
-9. Installs and enables `disable-modules.service`, which sets
+10. Installs and enables `disable-modules.service`, which sets
    `kernel.modules_disabled=1` three minutes after each boot. It takes effect
    from the next reboot; module loading is left alone on the running system.
-10. Installs `/etc/systemd/journald.conf.d/10-retention.conf`.
+11. Installs `/etc/systemd/journald.conf.d/10-retention.conf`.
 
 Managed files are only rewritten when their content changes, and the affected
 service is reloaded when they are.
