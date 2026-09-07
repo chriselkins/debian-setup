@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+#
+# Baseline provisioning for my Debian 13 servers.
+#
+# Bootstrap on a fresh install, as root:
+#
+#   wget -nv -O - https://raw.githubusercontent.com/chriselkins/debian-setup/main/setup.sh | bash
+#
+# Every step is idempotent, so re-run it at any time to check a server against
+# the current baseline or to apply additions made to this script.
+
+set -euo pipefail
+
+SSH_KEY='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIFY06TgZyT7svTpIbitLw9x/1Dq85m58jDfwsbsN9wzlAAAABHNzaDo= xinix-yubikey'
+
+COMET_URL='https://comet.adcmsp.com/api/v1/admin/branding/generate-client/by-platform'
+COMET_POST_DATA='SelfAddress=https%3A%2F%2Fcomet.adcmsp.com%2F&Platform=21'
+
+PACKAGES=(
+  apt-transport-https bash-completion bat bind9-dnsutils bind9-host bsdextrautils
+  build-essential ca-certificates curl entr fd-find file fzf gh git git-lfs gnupg
+  jq lsb-release moreutils ncdu openssh-server openssl p7zip-full pipx pkg-config
+  python3-pip python3-venv ripgrep rsync shellcheck sqlite3 sudo systemd-timesyncd
+  tmux tree unattended-upgrades unzip vim whois xxd yq zip zstd apparmor
+  apparmor-utils apparmor-profiles
+)
+
+# --- helpers -----------------------------------------------------------------
+
+log()  { printf '\n==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ask PROMPT DEFAULT: print the answer, or DEFAULT if the user just hits Enter.
+ask() {
+  local reply
+  read -r -p "$1 [$2]: " reply || true
+  printf '%s\n' "${reply:-$2}"
+}
+
+# ask_yn PROMPT DEFAULT(y|n): print y or n.
+ask_yn() {
+  local hint reply
+  if [[ $2 == y ]]; then hint='Y/n'; else hint='y/N'; fi
+  while true; do
+    read -r -p "$1 [$hint]: " reply || true
+    case ${reply:-$2} in
+      [Yy]|[Yy][Ee][Ss]) echo y; return ;;
+      [Nn]|[Nn][Oo])     echo n; return ;;
+    esac
+  done
+}
+
+# install_file PATH MODE, with the content on stdin. Writes the file only when
+# its content differs. Returns 0 if written and 1 if it was already up to date,
+# so the caller can decide whether a service needs reloading.
+install_file() {
+  local path=$1 mode=$2 tmp
+  mkdir -p "$(dirname "$path")"
+  tmp=$(mktemp "$path.XXXXXX")
+  cat >"$tmp"
+  if cmp -s "$tmp" "$path" 2>/dev/null; then
+    rm -f "$tmp"
+    chmod "$mode" "$path"
+    echo "$path is up to date"
+    return 1
+  fi
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$path"
+  echo "wrote $path"
+}
+
+# Non-root users whose authorized_keys already contains the key.
+key_holders() {
+  local name home
+  while IFS=: read -r name _ _ _ _ home _; do
+    [[ $name != root && -f $home/.ssh/authorized_keys ]] || continue
+    grep -qxF "$SSH_KEY" "$home/.ssh/authorized_keys" && echo "$name"
+  done </etc/passwd
+  return 0
+}
+
+# --- preflight and questions -------------------------------------------------
+
+preflight() {
+  [[ $EUID -eq 0 ]] || die "this script must run as root"
+  # shellcheck source=/dev/null
+  . /etc/os-release
+  [[ ${ID:-} == debian ]] || die "this script is for Debian, detected: ${PRETTY_NAME:-unknown}"
+  if [[ ${VERSION_ID:-} != 13 ]]; then
+    warn "this script targets Debian 13, detected: ${PRETTY_NAME:-unknown}"
+    [[ $(ask_yn "Continue anyway?" n) == y ]] || exit 1
+  fi
+}
+
+# Everything is asked up front so the rest of the run needs no attention.
+gather_answers() {
+  local default_users answer user holders holder=''
+
+  INSTALL_COMET=$(ask_yn "Download and install Comet Backup?" n)
+
+  default_users=$(awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1 }' /etc/passwd | paste -sd ' ')
+  while true; do
+    answer=$(ask "Install the SSH key for which users? (space-separated, 'none' to skip)" "${default_users:-none}")
+    [[ $answer == none ]] && answer=''
+    read -r -a KEY_USERS <<<"${answer//,/ }"
+    for user in "${KEY_USERS[@]}"; do
+      if ! getent passwd "$user" >/dev/null; then
+        warn "user '$user' does not exist"
+        continue 2
+      fi
+    done
+    break
+  done
+
+  # Hardening sshd while no non-root user holds the key would lock me out.
+  mapfile -t holders < <(key_holders)
+  for user in "${holders[@]}" "${KEY_USERS[@]}"; do
+    [[ $user == root ]] || holder=$user
+  done
+  APPLY_SSHD=y
+  if [[ -z $holder ]]; then
+    warn "no non-root user will have the SSH key; hardening sshd now (no root login, no passwords) would lock you out"
+    APPLY_SSHD=$(ask_yn "Apply the sshd hardening anyway?" n)
+  fi
+
+  INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows SSH and ICMP in, drops everything else)" n)
+
+  AUTO_REBOOT=$(ask_yn "Let unattended-upgrades reboot automatically at 03:00 when needed?" y)
+
+  while true; do
+    JOURNAL_MAX_USE=$(ask "journald SystemMaxUse" 16G)
+    [[ $JOURNAL_MAX_USE =~ ^[0-9]+[KMGT]?$ ]] && break
+    warn "expected a size such as 16G or 500M"
+  done
+  while true; do
+    JOURNAL_RETENTION=$(ask "journald MaxRetentionSec" 30day)
+    [[ $JOURNAL_RETENTION =~ ^[0-9]+[[:space:]]*[a-z]*$ ]] && break
+    warn "expected a time span such as 30day, 2week or 12h"
+  done
+}
+
+# --- steps -------------------------------------------------------------------
+
+step_packages() {
+  log "Installing baseline packages"
+  apt-get update
+  # Installed before the upgrade: unattended-upgrades ships the kernel hook
+  # that creates /run/reboot-required, which finish() checks.
+  apt-get install -y "${PACKAGES[@]}"
+  log "Upgrading installed packages"
+  apt-get full-upgrade -y
+}
+
+step_timesync() {
+  log "Enabling time synchronisation"
+  systemctl enable --now systemd-timesyncd
+}
+
+step_comet() {
+  local tmp deb name
+  log "Installing Comet Backup"
+  # The package prompts for the Comet username, password and server URL (debconf).
+  tmp=$(mktemp -d)
+  (cd "$tmp" && curl -f --progress-bar -O -J -d "$COMET_POST_DATA" -X POST "$COMET_URL")
+  deb=$(find "$tmp" -maxdepth 1 -type f -name '*.deb' -print -quit)
+  [[ -n $deb ]] || die "the Comet download did not produce a .deb in $tmp"
+  name=$(basename "$deb")
+  mv -f "$deb" "/$name"
+  chmod 0644 "/$name"
+  rmdir "$tmp"
+  apt-get install -y "/$name"
+  rm -f "/$name"
+}
+
+step_ssh_keys() {
+  local user home ak
+  [[ ${#KEY_USERS[@]} -gt 0 ]] || return 0
+  log "Installing the SSH key"
+  for user in "${KEY_USERS[@]}"; do
+    home=$(getent passwd "$user" | cut -d: -f6)
+    [[ -d $home ]] || die "home directory $home of $user does not exist"
+    install -d -m 0700 -o "$user" -g "$(id -gn "$user")" "$home/.ssh"
+    ak=$home/.ssh/authorized_keys
+    touch "$ak"
+    chown "$user:" "$ak"
+    chmod 0600 "$ak"
+    if grep -qxF "$SSH_KEY" "$ak"; then
+      echo "$user already has the key"
+    else
+      # A missing trailing newline would glue the key onto the last line.
+      [[ -s $ak && -n $(tail -c1 "$ak") ]] && echo >>"$ak"
+      printf '%s\n' "$SSH_KEY" >>"$ak"
+      echo "added the key for $user"
+    fi
+  done
+}
+
+step_sshd() {
+  log "Hardening sshd"
+  if install_file /etc/ssh/sshd_config.d/00-hardening.conf 0644 <<'EOF'
+# Managed by debian-setup; local edits are overwritten on the next run.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+X11Forwarding no
+PermitTunnel no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+LoginGraceTime 30
+MaxAuthTries 3
+EOF
+  then
+    if ! sshd -t; then
+      rm -f /etc/ssh/sshd_config.d/00-hardening.conf
+      die "sshd rejected the new configuration, so it was removed again"
+    fi
+    systemctl try-reload-or-restart ssh
+  fi
+}
+
+step_firewall() {
+  local changed=n
+  log "Configuring the nftables firewall"
+  apt-get install -y nftables
+  # Loaded at boot before disable-modules.service locks module loading, so the
+  # ruleset can still be reloaded afterwards.
+  install_file /etc/modules-load.d/firewall.conf 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+nf_tables
+nf_conntrack
+nft_ct
+nft_limit
+EOF
+  install_file /etc/nftables.conf 0755 <<'EOF' && changed=y
+#!/usr/sbin/nft -f
+# Managed by debian-setup; local edits are overwritten on the next run.
+
+flush ruleset
+
+table inet filter {
+	# New SSH connections per source address, refreshed on every attempt.
+	set ssh_ratelimit {
+		type ipv4_addr
+		flags dynamic
+		timeout 60s
+	}
+	set ssh_ratelimit6 {
+		type ipv6_addr
+		flags dynamic
+		timeout 60s
+	}
+
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept, invalid : drop }
+		iifname "lo" accept
+
+		ip protocol icmp accept
+		meta l4proto ipv6-icmp accept
+
+		tcp dport 22 ct state new update @ssh_ratelimit { ip saddr limit rate 3/minute } accept
+		tcp dport 22 ct state new update @ssh_ratelimit6 { ip6 saddr limit rate 3/minute } accept
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}
+EOF
+  systemctl enable --now nftables
+  if [[ $changed == y ]]; then
+    systemctl reload nftables
+  fi
+}
+
+step_unattended_upgrades() {
+  log "Configuring unattended upgrades"
+  install_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF' || true
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  {
+    cat <<'EOF'
+// Managed by debian-setup; local edits are overwritten on the next run.
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Debian,codename=${distro_codename}-updates";
+        "origin=Debian,codename=${distro_codename},label=Debian";
+        "origin=Debian,codename=${distro_codename},label=Debian-Security";
+        "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+};
+EOF
+    if [[ $AUTO_REBOOT == y ]]; then
+      cat <<'EOF'
+
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+EOF
+    fi
+  } | install_file /etc/apt/apt.conf.d/52unattended-upgrades-local 0644 || true
+  systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+}
+
+step_sysctl() {
+  log "Configuring sysctl"
+  install_file /etc/sysctl.d/42-local.conf 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+# kernel.modules_disabled=1 is set via systemd unit
+net.ipv4.tcp_ecn=1
+net.ipv4.tcp_ecn_fallback=1
+net.ipv4.tcp_congestion_control=bbr
+net.core.default_qdisc=fq
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+net.core.bpf_jit_harden=2
+kernel.yama.ptrace_scope=3
+kernel.kexec_load_disabled=1
+#kernel.unprivileged_userns_clone=0
+#user.max_user_namespaces=0
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_timestamps=1
+kernel.randomize_va_space=2
+dev.tty.ldisc_autoload=0
+kernel.perf_event_paranoid=3
+vm.unprivileged_userfaultfd=0
+kernel.sysrq=4
+fs.suid_dumpable=0
+kernel.unprivileged_bpf_disabled=1
+fs.protected_fifos=2
+fs.protected_hardlinks=1
+fs.protected_regular=2
+fs.protected_symlinks=1
+# https://gitlab.tails.boum.org/tails/tails/-/blob/master/config/chroot_local-includes/etc/sysctl.d/mmap_aslr.conf
+# These settings are set to the maximum supported value in order to improve ASLR effectiveness for mmap, at the cost of increased address-space fragmentation.
+vm.mmap_rnd_bits=32
+vm.mmap_rnd_compat_bits=16
+# Uncomment the next two lines to enable Spoof protection (reverse-path filter)
+# Turn on Source Address Verification in all interfaces to
+# prevent some spoofing attacks
+net.ipv4.conf.default.rp_filter=2
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.tcp_syncookies=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv6.conf.all.accept_source_route=-1
+net.ipv4.conf.default.accept_source_route=0
+net.ipv6.conf.default.accept_source_route=-1
+net.ipv4.conf.all.log_martians=0
+net.ipv4.conf.default.log_martians=0
+net.ipv4.icmp_echo_ignore_broadcasts=1
+EOF
+  # Loaded at boot before disable-modules.service locks module loading, so the
+  # bbr and fq sysctls above keep working.
+  install_file /etc/modules-load.d/network-performance.conf 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+tcp_bbr
+sch_fq
+EOF
+  sysctl --system >/dev/null || warn "some sysctl settings could not be applied (expected inside a container)"
+}
+
+step_disable_modules() {
+  log "Installing the kernel module loading lock"
+  install_file /usr/local/sbin/disable-modules.sh 0755 <<'EOF' || true
+#!/bin/bash
+# Managed by debian-setup; local edits are overwritten on the next run.
+set -euo pipefail
+/usr/sbin/sysctl -w kernel.modules_disabled=1
+EOF
+  if install_file /etc/systemd/system/disable-modules.service 0644 <<'EOF'
+# Managed by debian-setup; local edits are overwritten on the next run.
+[Unit]
+Description=Disable Kernel Module Loading
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 180
+ExecStart=/usr/local/sbin/disable-modules.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  then
+    systemctl daemon-reload
+  fi
+  # Enabled for the next boot only: locking modules on the running system
+  # would get in the way of anything else being installed today.
+  systemctl enable disable-modules.service
+}
+
+step_journald() {
+  log "Configuring journald retention"
+  if install_file /etc/systemd/journald.conf.d/10-retention.conf 0644 <<EOF
+# Managed by debian-setup; local edits are overwritten on the next run.
+[Journal]
+Storage=persistent
+SplitMode=uid
+SystemMaxUse=$JOURNAL_MAX_USE
+SystemMaxFiles=2000
+MaxRetentionSec=$JOURNAL_RETENTION
+EOF
+  then
+    systemctl restart systemd-journald
+  fi
+}
+
+finish() {
+  log "Done"
+  if [[ -f /run/reboot-required ]]; then
+    warn "a reboot is required to finish applying updates"
+  fi
+}
+
+main() {
+  preflight
+  gather_answers
+  step_packages
+  step_timesync
+  if [[ $INSTALL_COMET == y ]]; then
+    step_comet
+  fi
+  step_ssh_keys
+  if [[ $APPLY_SSHD == y ]]; then
+    step_sshd
+  else
+    warn "skipped the sshd hardening"
+  fi
+  if [[ $INSTALL_FIREWALL == y ]]; then
+    step_firewall
+  fi
+  step_unattended_upgrades
+  step_sysctl
+  step_disable_modules
+  step_journald
+  finish
+}
+
+# When piped into bash, stdin is the script itself. Point main at the terminal
+# so the prompts (and anything else that reads stdin, such as apt) work.
+if ! { : </dev/tty; } 2>/dev/null; then
+  die "no terminal available, run this from an interactive shell"
+fi
+main "$@" </dev/tty
