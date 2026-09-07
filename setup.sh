@@ -70,6 +70,26 @@ install_file() {
   echo "wrote $path"
 }
 
+# grub_cmdline NAME PARAMS: install /etc/default/grub.d/NAME.cfg, which appends
+# PARAMS to the kernel command line, and run update-grub when it changed.
+grub_cmdline() {
+  local name=$1 params=$2
+  if ! command -v update-grub >/dev/null; then
+    warn "update-grub not found, skipped adding '$params' to the kernel command line"
+    return 0
+  fi
+  # grub-mkconfig sources /etc/default/grub and then /etc/default/grub.d/*.cfg,
+  # so this appends to whatever the installer put in GRUB_CMDLINE_LINUX.
+  if install_file "/etc/default/grub.d/$name.cfg" 0644 <<EOF
+# Managed by debian-setup; local edits are overwritten on the next run.
+GRUB_CMDLINE_LINUX="\$GRUB_CMDLINE_LINUX $params"
+EOF
+  then
+    update-grub
+    BOOTLINE_CHANGED=y
+  fi
+}
+
 # Non-root users whose authorized_keys already contains the key.
 key_holders() {
   local name home
@@ -140,6 +160,8 @@ gather_answers() {
     [[ $JOURNAL_RETENTION =~ ^[0-9]+[[:space:]]*[a-z]*$ ]] && break
     warn "expected a time span such as 30day, 2week or 12h"
   done
+
+  ENABLE_FIM=$(ask_yn "Enable file integrity monitoring? (AIDE, auditd watches, weekly debsums checks)" n)
 }
 
 # --- steps -------------------------------------------------------------------
@@ -298,21 +320,7 @@ EOF
 
 step_bootline() {
   log "Hardening the kernel command line"
-  if ! command -v update-grub >/dev/null; then
-    warn "update-grub not found, skipped the kernel command line hardening"
-    return 0
-  fi
-  # grub-mkconfig sources /etc/default/grub and then /etc/default/grub.d/*.cfg,
-  # so this appends to whatever the installer put in GRUB_CMDLINE_LINUX.
-  # shellcheck disable=SC2016
-  if install_file /etc/default/grub.d/00-baseline.cfg 0644 <<'EOF'
-# Managed by debian-setup; local edits are overwritten on the next run.
-GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX mitigations=auto lockdown=confidentiality randomize_kstack_offset=on init_on_alloc=1 slab_nomerge apparmor=1"
-EOF
-  then
-    update-grub
-    BOOTLINE_CHANGED=y
-  fi
+  grub_cmdline 00-baseline 'mitigations=auto lockdown=confidentiality randomize_kstack_offset=on init_on_alloc=1 slab_nomerge apparmor=1'
 }
 
 step_unattended_upgrades() {
@@ -456,6 +464,163 @@ EOF
   fi
 }
 
+step_fim() {
+  local init_db=n
+  log "Configuring file integrity monitoring"
+  # auditd refuses dir= rules for directories that do not exist, and the AIDE
+  # baseline should include them from the start.
+  install -d -m 0700 /root/.ssh
+  install -d -m 0755 /var/spool/cron
+  # systemd-cron replaces cron and runs the cron.weekly debsums job from a timer.
+  apt-get install -y debsums aide aide-common auditd systemd-cron
+  systemctl enable --now cron.target
+  # Debian's aide.conf includes the files in aide.conf.d whose names match
+  # ^[a-zA-Z0-9_-]+$ and runs the executable ones, hence no extension.
+  if install_file /etc/aide/aide.conf.d/99_local_fim 0644 <<'EOF'
+# Managed by debian-setup; local edits are overwritten on the next run.
+# Local File Integrity Monitoring rules
+#
+# Debian's aide-common package already supplies extensive Debian-aware
+# rules. These rules add stronger coverage for locally managed software,
+# administrator SSH configuration, and other local content.
+#
+# X includes supported extended security metadata such as ACLs, xattrs,
+# filesystem attributes, SELinux labels (when applicable), and capabilities.
+#
+# A single SHA-512 hash is sufficient here and avoids calculating every
+# hash algorithm in AIDE's H/Checksums group.
+
+LocalFIM = p+ftype+i+l+n+u+g+s+b+m+c+sha512+X
+
+
+# Locally installed software and administrator-managed binaries.
+/usr/local LocalFIM
+
+
+# Root SSH credentials and authorized keys.
+/root/.ssh LocalFIM
+
+
+# SSH credentials for normal users.
+# This matches /home/<username>/.ssh and everything below it.
+/home/[^/]+/\.ssh LocalFIM
+
+
+# ----------------------------------------------------------------------
+# OPTIONAL APPLICATION-SPECIFIC STATIC TREES
+# ----------------------------------------------------------------------
+#
+# Add directories here ONLY if their contents are expected to remain
+# unchanged between legitimate deployments.
+#
+# Examples:
+#
+# /opt/myapp/bin LocalFIM
+# /opt/myapp/config LocalFIM
+# /apps/scripts LocalFIM
+#
+# Do NOT blindly add database directories, logs, caches, uploads,
+# PHP sessions, Redis data, MySQL data, or other frequently changing data.
+#
+# Examples that normally should NOT be added wholesale:
+#
+# /var/log
+# /var/lib/mysql
+# /var/lib/redis
+# /tmp
+# /run
+EOF
+  then
+    if ! aide --config=/etc/aide/aide.conf --config-check; then
+      rm -f /etc/aide/aide.conf.d/99_local_fim
+      die "aide rejected the new rules, so they were removed again"
+    fi
+    init_db=y
+  fi
+  if install_file /etc/audit/rules.d/40-fim.rules 0640 <<'EOF'
+# Managed by debian-setup; local edits are overwritten on the next run.
+# File Integrity Monitoring - auditd
+#
+# Record writes and metadata changes to security-sensitive areas.
+#
+# w = write operations
+# a = attribute/metadata changes
+#
+# b64 selects the native 64-bit syscall ABI.
+
+# ----------------------------------------------------------------------
+# System configuration
+# ----------------------------------------------------------------------
+
+-a always,exit -F arch=b64 -F dir=/etc/ -F perm=wa -F key=fim_etc
+
+
+# ----------------------------------------------------------------------
+# Boot configuration and bootloader files
+# ----------------------------------------------------------------------
+
+-a always,exit -F arch=b64 -F dir=/boot/ -F perm=wa -F key=fim_boot
+
+
+# ----------------------------------------------------------------------
+# Locally installed executables, libraries, and administrator software
+# ----------------------------------------------------------------------
+
+-a always,exit -F arch=b64 -F dir=/usr/local/ -F perm=wa -F key=fim_usrlocal
+
+
+# ----------------------------------------------------------------------
+# Cron user crontabs
+# ----------------------------------------------------------------------
+
+-a always,exit -F arch=b64 -F dir=/var/spool/cron/ -F perm=wa -F key=fim_cron
+
+
+# ----------------------------------------------------------------------
+# Root SSH keys and authorized_keys
+# ----------------------------------------------------------------------
+
+-a always,exit -F arch=b64 -F dir=/root/.ssh/ -F perm=wa -F key=fim_rootssh
+
+
+# ----------------------------------------------------------------------
+# AIDE reference database
+# ----------------------------------------------------------------------
+
+-a always,exit -F arch=b64 -F path=/var/lib/aide/aide.db -F perm=wa -F key=fim_aidedb
+EOF
+  then
+    # augenrules merges rules.d into /etc/audit/audit.rules and loads it with
+    # auditctl, whose exit status is the only syntax check there is. Rules
+    # that do not load would also stop auditd from starting at boot.
+    if ! augenrules --load; then
+      rm -f /etc/audit/rules.d/40-fim.rules
+      augenrules --load || true
+      die "auditd could not load the new rules, so they were removed again"
+    fi
+  fi
+  install_file /etc/default/debsums 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+# Defaults for debsums cron jobs
+# sourced by the debsums cron scripts
+
+#
+# This is a POSIX shell fragment
+#
+
+# Perform Debian package checksum verification weekly.
+CRON_CHECK=weekly
+EOF
+  grub_cmdline 00-audit audit=1
+  # Last, so the baseline includes the files written above. Only when the
+  # database is missing or the rules changed: re-running the script must not
+  # silently re-baseline a server.
+  if [[ $init_db == y || ! -f /var/lib/aide/aide.db ]]; then
+    log "Initialising the AIDE database (this walks the whole filesystem)"
+    aideinit -y -f
+  fi
+}
+
 finish() {
   log "Done"
   if [[ -f /run/reboot-required ]]; then
@@ -490,6 +655,9 @@ main() {
   step_sysctl
   step_disable_modules
   step_journald
+  if [[ $ENABLE_FIM == y ]]; then
+    step_fim
+  fi
   finish
 }
 

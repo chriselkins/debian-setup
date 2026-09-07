@@ -19,6 +19,7 @@ It asks a few questions up front and then runs unattended:
 - whether to harden the kernel command line (default no)
 - whether unattended-upgrades may reboot automatically at 03:00
 - journald `SystemMaxUse` and `MaxRetentionSec` (defaults 16G and 30day)
+- whether to enable file integrity monitoring (default no)
 
 ## What it does
 
@@ -49,6 +50,18 @@ It asks a few questions up front and then runs unattended:
    `kernel.modules_disabled=1` three minutes after each boot. It takes effect
    from the next reboot; module loading is left alone on the running system.
 11. Installs `/etc/systemd/journald.conf.d/10-retention.conf`.
+12. Optionally sets up file integrity monitoring: installs AIDE, auditd,
+   debsums and systemd-cron (which replaces cron and enables `cron.target`),
+   makes sure `/root/.ssh` (0700) and `/var/spool/cron` (0755) exist for the
+   audit watches, adds `/etc/aide/aide.conf.d/99_local_fim` (SHA-512 and
+   extended attributes for `/usr/local`, `/root/.ssh` and every user's
+   `.ssh`), loads `/etc/audit/rules.d/40-fim.rules` (writes and attribute
+   changes under `/etc`, `/boot`, `/usr/local`, `/var/spool/cron`,
+   `/root/.ssh` and to the AIDE database), sets `CRON_CHECK=weekly` in
+   `/etc/default/debsums`, and adds `audit=1` to the kernel command line
+   through `/etc/default/grub.d/00-audit.cfg`, which takes effect from the
+   next reboot. The AIDE database is initialised when it is missing or the
+   local rules changed, never on a plain re-run.
 
 Managed files are only rewritten when their content changes, and the affected
 service is reloaded when they are.
