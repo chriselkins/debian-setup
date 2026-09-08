@@ -19,7 +19,8 @@ It asks a few questions up front and then runs unattended:
 
 - whether to download and install Comet Backup (the package then asks for the Comet
   username, password and server URL)
-- which users get my SSH key (defaults to the regular users on the box)
+- the SSH public key to install (Enter keeps mine) and which users get it
+  (defaults to the regular users on the box)
 - whether to restrict SSH logins to the `ssh-users` group, listing who will be
   in it (default yes), and whether to allow SSH TCP port forwarding (default no)
 - whether to enable the nftables firewall (default no)
@@ -44,12 +45,12 @@ It asks a few questions up front and then runs unattended:
    msmtp has no queue: a message is sent immediately or fails with a syslog
    entry from `msmtp`.
 4. Optionally downloads the Comet Backup client and installs it with apt.
-5. Adds my SSH key to `~/.ssh/authorized_keys` for the chosen users.
+5. Adds the SSH key to `~/.ssh/authorized_keys` for the chosen users.
 6. Hardens sshd through `/etc/ssh/sshd_config.d/99-hardening.conf`: key-only
    authentication, no root login, no agent forwarding, TCP forwarding only if
    asked for, `LogLevel VERBOSE` (logs the key fingerprint used), sessions
    whose client stops answering are dropped after ten minutes, and, when
-   confirmed, `AllowGroups ssh-users` with everyone who holds or receives my
+   confirmed, `AllowGroups ssh-users` with everyone who holds or receives the
    key added to that system group. If no non-root user holds the key this step
    warns and is skipped unless confirmed, so I cannot lock myself out.
 7. Optionally installs nftables with `/etc/nftables.conf`: input and forward

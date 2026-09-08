@@ -14,7 +14,7 @@ set -euo pipefail
 # Set by release.sh; 0.0.0 means an unreleased checkout.
 VERSION=1.0.1
 
-SSH_KEY='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIFY06TgZyT7svTpIbitLw9x/1Dq85m58jDfwsbsN9wzlAAAABHNzaDo= xinix-yubikey'
+DEFAULT_SSH_KEY='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIFY06TgZyT7svTpIbitLw9x/1Dq85m58jDfwsbsN9wzlAAAABHNzaDo= xinix-yubikey'
 
 COMET_URL='https://comet.adcmsp.com/api/v1/admin/branding/generate-client/by-platform'
 COMET_POST_DATA='SelfAddress=https%3A%2F%2Fcomet.adcmsp.com%2F&Platform=21'
@@ -115,6 +115,7 @@ preflight() {
     warn "this script targets Debian 13, detected: ${PRETTY_NAME:-unknown}"
     [[ $(ask_yn "Continue anyway?" n) == y ]] || exit 1
   fi
+  command -v ssh-keygen >/dev/null || die "ssh-keygen is missing, install openssh-client first"
 }
 
 # Everything is asked up front so the rest of the run needs no attention.
@@ -122,6 +123,12 @@ gather_answers() {
   local default_users answer user holders holder='' default_from
 
   INSTALL_COMET=$(ask_yn "Download and install Comet Backup?" n)
+
+  while true; do
+    SSH_KEY=$(ask "SSH public key to install" "$DEFAULT_SSH_KEY")
+    ssh-keygen -l -f - <<<"$SSH_KEY" >/dev/null 2>&1 && break
+    warn "expected an SSH public key, such as the line in ~/.ssh/id_ed25519.pub"
+  done
 
   default_users=$(awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1 }' /etc/passwd | paste -sd ' ')
   while true; do
