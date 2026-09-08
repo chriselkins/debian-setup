@@ -17,12 +17,12 @@ COMET_URL='https://comet.adcmsp.com/api/v1/admin/branding/generate-client/by-pla
 COMET_POST_DATA='SelfAddress=https%3A%2F%2Fcomet.adcmsp.com%2F&Platform=21'
 
 PACKAGES=(
-  apt-transport-https bash-completion bat bind9-dnsutils bind9-host bsdextrautils
+  bash-completion bat bind9-dnsutils bind9-host bsdextrautils
   build-essential ca-certificates curl entr fd-find file fzf gh git git-lfs gnupg
-  jq lsb-release moreutils ncdu openssh-server openssl p7zip-full pipx pkg-config
-  python3-pip python3-venv ripgrep rsync shellcheck sqlite3 sudo systemd-timesyncd
-  tmux tree unattended-upgrades unzip vim whois xxd yq zip zstd apparmor
-  apparmor-utils apparmor-profiles
+  jq lsb-release moreutils ncdu needrestart openssh-server openssl p7zip-full
+  pipx pkg-config python3-pip python3-venv ripgrep rsync shellcheck sqlite3 sudo
+  systemd-timesyncd tmux tree unattended-upgrades unzip vim whois xxd yq zip zstd
+  apparmor apparmor-utils apparmor-profiles
 )
 
 # --- helpers -----------------------------------------------------------------
@@ -349,6 +349,13 @@ EOF
     fi
   } | install_file /etc/apt/apt.conf.d/52unattended-upgrades-local 0644 || true
   systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+  # needrestart's apt hook restarts the services that use an upgraded library,
+  # so an openssl fix takes effect without the reboot only kernel and libc
+  # updates trigger. 'a' restarts without asking, also in unattended runs.
+  install_file /etc/needrestart/conf.d/50-debian-setup.conf 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+$nrconf{restart} = 'a';
+EOF
 }
 
 step_sysctl() {
