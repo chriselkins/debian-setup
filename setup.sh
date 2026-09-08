@@ -495,8 +495,11 @@ EOF
 }
 
 step_bootline() {
+  local params='mitigations=auto lockdown=confidentiality randomize_kstack_offset=on init_on_alloc=1 slab_nomerge apparmor=1 page_alloc.shuffle=1 debugfs=off'
   log "Hardening the kernel command line"
-  grub_cmdline 00-baseline 'mitigations=auto lockdown=confidentiality randomize_kstack_offset=on init_on_alloc=1 slab_nomerge apparmor=1'
+  # The legacy vsyscall page only exists on x86-64.
+  [[ $(uname -m) == x86_64 ]] && params+=' vsyscall=none'
+  grub_cmdline 00-baseline "$params"
 }
 
 step_unattended_upgrades() {
@@ -563,6 +566,8 @@ net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_timestamps=1
 kernel.randomize_va_space=2
 dev.tty.ldisc_autoload=0
+dev.tty.legacy_tiocsti=0
+net.ipv4.tcp_rfc1337=1
 kernel.perf_event_paranoid=3
 vm.unprivileged_userfaultfd=0
 kernel.sysrq=4
@@ -811,6 +816,33 @@ EOF
   fi
 }
 
+step_coredumps() {
+  log "Disabling core dumps"
+  # fs.suid_dumpable=0 in the sysctl baseline covers setuid programs; this
+  # covers everything else. systemd-coredump still logs the crash itself.
+  install_file /etc/systemd/coredump.conf.d/10-disable.conf 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+EOF
+  # For login sessions. Wildcard limits do not apply to root, hence both lines.
+  install_file /etc/security/limits.d/10-core.conf 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+*    hard core 0
+root hard core 0
+EOF
+  # For services.
+  if install_file /etc/systemd/system.conf.d/10-core.conf 0644 <<'EOF'
+# Managed by debian-setup; local edits are overwritten on the next run.
+[Manager]
+DefaultLimitCORE=0
+EOF
+  then
+    systemctl daemon-reexec
+  fi
+}
+
 finish() {
   log "Done"
   if [[ -f /run/reboot-required ]]; then
@@ -849,6 +881,7 @@ main() {
   step_sysctl
   step_disable_modules
   step_journald
+  step_coredumps
   if [[ $ENABLE_FIM == y ]]; then
     step_fim
   fi
