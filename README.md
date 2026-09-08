@@ -77,9 +77,11 @@ It asks a few questions up front and then runs unattended:
    `kernel.modules_disabled=1` three minutes after each boot. It takes effect
    from the next reboot; module loading is left alone on the running system.
 12. Installs `/etc/systemd/journald.conf.d/10-retention.conf`.
-13. Disables core dumps: `Storage=none` for systemd-coredump, a hard core
-   limit of 0 for login sessions (`/etc/security/limits.d/10-core.conf`) and
-   for services (`DefaultLimitCORE=0`).
+13. Disables core dumps: `kernel.core_pattern` piped to `/bin/false`
+   (`/etc/sysctl.d/60-coredump.conf`), a hard core limit of 0 for login
+   sessions (`/etc/security/limits.d/10-core.conf`) and for services
+   (`DefaultLimitCORE=0`), and `Storage=none` for systemd-coredump in case
+   it is ever installed.
 14. Optionally sets up file integrity monitoring: installs AIDE, auditd,
    debsums and systemd-cron (which replaces cron and enables `cron.target`),
    makes sure `/root/.ssh` (0700) and `/var/spool/cron` (0755) exist for the

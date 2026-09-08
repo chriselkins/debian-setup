@@ -907,8 +907,19 @@ EOF
 
 step_coredumps() {
   log "Disabling core dumps"
-  # fs.suid_dumpable=0 in the sysctl baseline covers setuid programs; this
-  # covers everything else. systemd-coredump still logs the crash itself.
+  # Debian's systemd sets kernel.core_pattern=core, so the kernel writes a core
+  # file into the crashing process's working directory whenever its core limit
+  # allows. The limits below stop that for everyone but root, who can raise
+  # them; piping the dump to /bin/false stops it for root too. Named to sort
+  # after the 50-coredump.conf that systemd-coredump ships if it is ever
+  # installed, while leaving room above it for a local override.
+  install_file /etc/sysctl.d/60-coredump.conf 0644 <<'EOF' || true
+# Managed by debian-setup; local edits are overwritten on the next run.
+kernel.core_pattern=|/bin/false
+EOF
+  sysctl -q -p /etc/sysctl.d/60-coredump.conf || warn "kernel.core_pattern could not be applied (expected inside a container)"
+  # systemd-coredump is not installed here; this keeps it from storing anything
+  # if it is added later and a local override points core_pattern back at it.
   install_file /etc/systemd/coredump.conf.d/10-disable.conf 0644 <<'EOF' || true
 # Managed by debian-setup; local edits are overwritten on the next run.
 [Coredump]
