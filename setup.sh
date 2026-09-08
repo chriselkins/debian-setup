@@ -106,6 +106,37 @@ key_holders() {
 
 # --- preflight and questions -------------------------------------------------
 
+# The firewall below permits only port 22. Check both Port and per-address
+# port overrides before changing any firewall files or enabling the service.
+check_firewall_ssh_ports() {
+  local config directive value found=n
+  if ! config=$(sshd -T); then
+    warn "cannot read the effective sshd configuration; firewall left unchanged"
+    return 1
+  fi
+  while read -r directive value; do
+    case $directive in
+      port)
+        found=y
+        if [[ $value != 22 ]]; then
+          warn "sshd uses port $value, but this firewall permits only port 22; firewall left unchanged"
+          return 1
+        fi
+        ;;
+      listenaddress)
+        if [[ ${value##*:} != 22 ]]; then
+          warn "sshd listens on $value, but this firewall permits only port 22; firewall left unchanged"
+          return 1
+        fi
+        ;;
+    esac
+  done <<<"$config"
+  if [[ $found != y ]]; then
+    warn "no SSH port found in the effective configuration; firewall left unchanged"
+    return 1
+  fi
+}
+
 preflight() {
   [[ $EUID -eq 0 ]] || die "this script must run as root"
   # shellcheck source=/dev/null
@@ -447,6 +478,7 @@ EOF
 step_firewall() {
   local changed=n
   log "Configuring the nftables firewall"
+  check_firewall_ssh_ports || die "resolve the SSH port configuration before enabling this firewall"
   apt-get install -y nftables
   # Loaded at boot before disable-modules.service locks module loading, so the
   # ruleset can still be reloaded afterwards.

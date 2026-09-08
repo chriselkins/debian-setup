@@ -23,7 +23,7 @@ It asks a few questions up front and then runs unattended:
   (defaults to the regular users on the box)
 - whether to restrict SSH logins to the `ssh-users` group, listing who will be
   in it (default yes), and whether to allow SSH TCP port forwarding (default no)
-- whether to enable the nftables firewall (default no)
+- whether to enable the nftables firewall (default no; requires SSH on port 22)
 - whether to harden the kernel command line (default no)
 - whether unattended-upgrades may reboot automatically at 03:00
 - journald `SystemMaxUse` and `MaxRetentionSec` (defaults 16G and 30day)

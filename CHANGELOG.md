@@ -8,6 +8,11 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+### Fixed
+- Check the effective sshd ports before enabling the port-22-only firewall.
+  Abort without changing the firewall if SSH uses another port, including
+  a ListenAddress override, or the configuration cannot be checked.
+
 ## [1.1.0] - 2026-09-07
 
 ### Changed
