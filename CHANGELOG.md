@@ -8,6 +8,8 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-08
+
 ### Added
 - The firewall now asks whether to allow SSH in (default yes) and for
   additional TCP and UDP ports to allow in (default none): new connections to
