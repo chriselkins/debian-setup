@@ -8,6 +8,8 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-08
+
 ### Added
 - Enabling the firewall on a server whose `/etc/nftables.conf` is neither the
   untouched nftables package default nor written by an earlier run now asks
