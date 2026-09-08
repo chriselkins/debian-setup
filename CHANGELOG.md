@@ -8,6 +8,12 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+### Added
+- Enabling the firewall on a server whose `/etc/nftables.conf` is neither the
+  untouched nftables package default nor written by an earlier run now asks
+  before overwriting it (default no, which skips the firewall step). The
+  package default and this script's own file are replaced as before.
+
 ## [1.2.0] - 2026-09-08
 
 ### Added

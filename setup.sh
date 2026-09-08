@@ -169,6 +169,19 @@ sshd_listens_only_on_22() {
   return 1
 }
 
+# custom_ruleset PATH: whether PATH holds someone's own ruleset rather than the
+# untouched conffile from the nftables package or the file from an earlier run.
+custom_ruleset() {
+  local shipped
+  [[ -e $1 ]] || return 1
+  grep -q '^# Managed by debian-setup' "$1" && return 1
+  # dpkg records the md5 of every conffile as shipped, which is how it tells a
+  # modified conffile from a pristine one.
+  shipped=$(dpkg-query -W -f "\${Conffiles}" nftables 2>/dev/null | awk -v path="$1" '$1 == path { print $2 }')
+  [[ -n $shipped && $(md5sum <"$1" | cut -d' ' -f1) == "$shipped" ]] && return 1
+  return 0
+}
+
 preflight() {
   [[ $EUID -eq 0 ]] || die "this script must run as root"
   # shellcheck source=/dev/null
@@ -239,6 +252,13 @@ gather_answers() {
     INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows ICMP and the ports you choose in, drops everything else)" n)
   else
     warn "skipping the nftables firewall, which would lock you out"
+  fi
+  # Someone's own ruleset is replaced only when confirmed; the package's
+  # untouched conffile and the file from an earlier run are just overwritten.
+  if [[ $INSTALL_FIREWALL == y ]] && custom_ruleset /etc/nftables.conf; then
+    warn "/etc/nftables.conf is neither the nftables package default nor written by this script"
+    INSTALL_FIREWALL=$(ask_yn "Overwrite /etc/nftables.conf with the generated ruleset?" n)
+    [[ $INSTALL_FIREWALL == y ]] || warn "keeping /etc/nftables.conf, skipping the nftables firewall"
   fi
   FIREWALL_SSH=n
   FIREWALL_TCP_PORTS=''

@@ -62,4 +62,28 @@ if ruleset n '' '' | grep -q 'ssh_ratelimit\|dport'; then
   echo 'FAIL: SSH sets or accept rules without SSH' >&2
   exit 1
 fi
+# custom_ruleset compares the file with the md5 dpkg recorded for the conffile.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+conf=$tmp/nftables.conf
+dpkg-query() { printf ' %s %s\n' "$conf" "$shipped_md5"; }
+expect_custom() {
+  if custom_ruleset "$conf"; then
+    [[ $1 == y ]] || { printf 'FAIL: treated %s as custom\n' "$2" >&2; exit 1; }
+  else
+    [[ $1 == n ]] || { printf 'FAIL: missed %s\n' "$2" >&2; exit 1; }
+  fi
+}
+printf 'flush ruleset\n' >"$conf"
+shipped_md5=$(md5sum <"$conf" | cut -d' ' -f1)
+expect_custom n 'the untouched package conffile'
+echo '# my own rules' >>"$conf"
+expect_custom y 'a modified conffile'
+ruleset y '' '' >"$conf"
+expect_custom n 'the file from an earlier run'
+shipped_md5=''
+printf 'flush ruleset\n' >"$conf"
+expect_custom y 'a file dpkg knows nothing about'
+rm "$conf"
+expect_custom n 'a missing file'
 echo 'Firewall ruleset tests passed'
