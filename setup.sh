@@ -33,8 +33,9 @@ die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 # ask PROMPT DEFAULT: print the answer, or DEFAULT if the user just hits Enter.
 ask() {
-  local reply
-  read -r -p "$1 [$2]: " reply || true
+  local reply hint=''
+  [[ -n $2 ]] && hint=" [$2]"
+  read -r -p "$1$hint: " reply || true
   printf '%s\n' "${reply:-$2}"
 }
 
@@ -115,7 +116,7 @@ preflight() {
 
 # Everything is asked up front so the rest of the run needs no attention.
 gather_answers() {
-  local default_users answer user holders holder=''
+  local default_users answer user holders holder='' default_from
 
   INSTALL_COMET=$(ask_yn "Download and install Comet Backup?" n)
 
@@ -162,6 +163,44 @@ gather_answers() {
   done
 
   ENABLE_FIM=$(ask_yn "Enable file integrity monitoring? (AIDE, auditd watches, weekly debsums checks)" n)
+
+  # AIDE, debsums, auditd, unattended-upgrades and the disk space check all
+  # report to root by mail, which goes nowhere without a smarthost.
+  ENABLE_MAIL=$(ask_yn "Set up outgoing mail so alerts (AIDE, debsums, auditd, upgrades, low disk space) reach you?" y)
+  if [[ $ENABLE_MAIL == y ]]; then
+    while true; do
+      MAIL_TO=$(ask "Deliver root's mail to" '')
+      [[ $MAIL_TO == *@* ]] && break
+      warn "expected an email address"
+    done
+    while true; do
+      MAIL_HOST=$(ask "SMTP smarthost" '')
+      [[ -n $MAIL_HOST ]] && break
+    done
+    while true; do
+      MAIL_PORT=$(ask "SMTP port (465 is TLS, anything else STARTTLS)" 465)
+      [[ $MAIL_PORT =~ ^[0-9]+$ && $MAIL_PORT -ge 1 && $MAIL_PORT -le 65535 ]] && break
+      warn "expected a port number"
+    done
+    MAIL_USER=$(ask "SMTP username ('none' for no authentication)" none)
+    [[ $MAIL_USER == none ]] && MAIL_USER=''
+    MAIL_PASSWORD=''
+    if [[ -n $MAIL_USER ]]; then
+      while true; do
+        read -r -s -p "SMTP password: " MAIL_PASSWORD || true
+        echo
+        [[ -n $MAIL_PASSWORD && $MAIL_PASSWORD != *\"* ]] && break
+        warn "the password must not be empty or contain a double quote"
+      done
+    fi
+    default_from=root@$(hostname -f 2>/dev/null || hostname)
+    [[ $MAIL_USER == *@* ]] && default_from=$MAIL_USER
+    while true; do
+      MAIL_FROM=$(ask "From address for outgoing mail" "$default_from")
+      [[ $MAIL_FROM == *@* ]] && break
+      warn "expected an email address"
+    done
+  fi
 }
 
 # --- steps -------------------------------------------------------------------
@@ -179,6 +218,104 @@ step_packages() {
 step_timesync() {
   log "Enabling time synchronisation"
   systemctl enable --now systemd-timesyncd
+}
+
+step_mail() {
+  local changed=n fqdn starttls=on
+  log "Configuring outgoing mail"
+  # msmtp verifies the smarthost certificate against the system CA store (dma
+  # cannot). bsd-mailx provides mail(1), which aide and unattended-upgrades use.
+  # msmtp asks whether to enable its AppArmor profile (default no); answer yes
+  # up front so the install does not stop at a prompt.
+  echo 'msmtp msmtp/apparmor boolean true' | debconf-set-selections
+  DEBIAN_FRONTEND=noninteractive apt-get install -y msmtp-mta bsd-mailx
+  # msmtp-mta also ships msmtpd, a local SMTP listener that nothing here needs.
+  systemctl disable --now msmtpd.service
+  [[ $MAIL_PORT == 465 ]] && starttls=off
+  fqdn=$(hostname -f 2>/dev/null || hostname)
+  {
+    cat <<EOF
+# Managed by debian-setup; local edits are overwritten on the next run.
+defaults
+syslog on
+aliases /etc/aliases
+tls on
+tls_trust_file system
+tls_starttls $starttls
+# Every message leaves from the same address, with the host as display name.
+set_from_header on
+from_full_name $fqdn
+
+account default
+host $MAIL_HOST
+port $MAIL_PORT
+from $MAIL_FROM
+EOF
+    if [[ -n $MAIL_USER ]]; then
+      cat <<EOF
+auth on
+user $MAIL_USER
+password "$MAIL_PASSWORD"
+EOF
+    fi
+  } | install_file /etc/msmtprc 0640 && changed=y
+  # The file holds the SMTP password; root:msmtp is what Debian recommends.
+  chgrp msmtp /etc/msmtprc
+  install_file /etc/aliases 0644 <<EOF && changed=y
+# Managed by debian-setup; local edits are overwritten on the next run.
+root: $MAIL_TO
+default: $MAIL_TO
+EOF
+  # systemd-cron's generator only mails job output when it finds an MTA.
+  systemctl daemon-reload
+  if [[ $changed == y ]]; then
+    if printf 'Subject: [%s] outgoing mail is configured\n\nSent by debian-setup on %s.\n' "$fqdn" "$fqdn" | sendmail root; then
+      echo "sent a test mail to $MAIL_TO"
+    else
+      warn "the test mail could not be sent, see 'journalctl -t msmtp'"
+    fi
+  fi
+}
+
+step_disk_alert() {
+  local changed=n
+  log "Installing the daily disk space check"
+  install_file /usr/local/sbin/check-disk-space 0755 <<'EOF' || true
+#!/bin/bash
+# Managed by debian-setup; local edits are overwritten on the next run.
+# Mail root when a local filesystem is at or above the threshold.
+set -euo pipefail
+threshold=90
+report=$(df -h --local --output=target,size,used,avail,pcent -x tmpfs -x devtmpfs -x squashfs -x overlay |
+  awk -v t="$threshold" 'NR == 1 || $NF + 0 >= t')
+[[ $(wc -l <<<"$report") -gt 1 ]] || exit 0
+printf 'Subject: [%s] disk space low\n\n%s\n' "$(hostname -f 2>/dev/null || hostname)" "$report" | sendmail root
+EOF
+  install_file /etc/systemd/system/check-disk-space.service 0644 <<'EOF' && changed=y
+# Managed by debian-setup; local edits are overwritten on the next run.
+[Unit]
+Description=Mail root when disk space is low
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/check-disk-space
+EOF
+  install_file /etc/systemd/system/check-disk-space.timer 0644 <<'EOF' && changed=y
+# Managed by debian-setup; local edits are overwritten on the next run.
+[Unit]
+Description=Daily disk space check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  if [[ $changed == y ]]; then
+    systemctl daemon-reload
+  fi
+  systemctl enable --now check-disk-space.timer
 }
 
 step_comet() {
@@ -345,6 +482,13 @@ EOF
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
 Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+EOF
+    fi
+    if [[ $ENABLE_MAIL == y ]]; then
+      cat <<'EOF'
+
+Unattended-Upgrade::Mail "root";
+Unattended-Upgrade::MailReport "only-on-error";
 EOF
     fi
   } | install_file /etc/apt/apt.conf.d/52unattended-upgrades-local 0644 || true
@@ -643,6 +787,10 @@ main() {
   gather_answers
   step_packages
   step_timesync
+  if [[ $ENABLE_MAIL == y ]]; then
+    step_mail
+    step_disk_alert
+  fi
   if [[ $INSTALL_COMET == y ]]; then
     step_comet
   fi
