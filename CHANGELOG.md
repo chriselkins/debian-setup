@@ -8,6 +8,15 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-07
+
+### Changed
+- The SSH key to install is now a prompt. Enter keeps my key, so a re-run on
+  a server set up with an earlier version changes nothing there; any other
+  key is checked with ssh-keygen before the run starts. The script now needs
+  openssh-client, which every standard install and every server running sshd
+  already has.
+
 ## [1.0.1] - 2026-09-07
 
 ### Fixed
