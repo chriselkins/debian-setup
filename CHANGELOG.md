@@ -12,6 +12,9 @@ release.sh turns the Unreleased section into the next version.
 - Reject SSH keys incompatible with the hardening policy before installing
   them: accept Ed25519, security-key Ed25519 and RSA keys of at least 3072
   bits. Malformed keys and certificates are rejected with an explanation.
+- Only offer the nftables firewall while sshd listens on port 22, the only
+  port the ruleset permits. A custom Port or ListenAddress port now skips the
+  firewall with a warning instead of locking you out.
 
 ## [1.1.0] - 2026-09-07
 

@@ -126,6 +126,30 @@ validate_ssh_key() {
   fi
 }
 
+# The firewall permits only port 22, so it would lock me out of an sshd that
+# listens elsewhere. Check Port and the per-address ListenAddress overrides.
+sshd_listens_only_on_22() {
+  local config directive value found=n
+  if ! config=$(sshd -T); then
+    warn "cannot read the effective sshd configuration"
+    return 1
+  fi
+  while read -r directive value; do
+    case $directive in
+      port|listenaddress)
+        found=y
+        if [[ ${value##*:} != 22 ]]; then
+          warn "sshd listens on $value, but the firewall permits only port 22"
+          return 1
+        fi
+        ;;
+    esac
+  done <<<"$config"
+  [[ $found == y ]] && return 0
+  warn "no SSH port found in the effective sshd configuration"
+  return 1
+}
+
 preflight() {
   [[ $EUID -eq 0 ]] || die "this script must run as root"
   # shellcheck source=/dev/null
@@ -190,7 +214,13 @@ gather_answers() {
     SSH_TCP_FORWARDING=$(ask_yn "Allow SSH TCP port forwarding (tunnels)?" n)
   fi
 
-  INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows SSH and ICMP in, drops everything else)" n)
+  # Without sshd installed yet, step_packages installs it on the default port.
+  INSTALL_FIREWALL=n
+  if ! command -v sshd >/dev/null || sshd_listens_only_on_22; then
+    INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows SSH and ICMP in, drops everything else)" n)
+  else
+    warn "skipping the nftables firewall, which would lock you out"
+  fi
 
   HARDEN_BOOTLINE=$(ask_yn "Harden the kernel command line? (lockdown=confidentiality, init_on_alloc, slab_nomerge, ...)" n)
 
