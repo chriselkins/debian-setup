@@ -8,6 +8,13 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+### Added
+- The firewall now asks whether to allow SSH in (default yes) and for
+  additional TCP and UDP ports to allow in (default none): new connections to
+  the TCP ports and all packets to the UDP ports are accepted. The defaults
+  produce the same ruleset as before, so a re-run with them changes nothing on
+  a server set up with the previous version.
+
 ## [1.1.1] - 2026-09-08
 
 ### Fixed

@@ -25,7 +25,9 @@ It asks a few questions up front and then runs unattended:
 - whether to restrict SSH logins to the `ssh-users` group, listing who will be
   in it (default yes), and whether to allow SSH TCP port forwarding (default no)
 - whether to enable the nftables firewall (default no; only offered while sshd
-  listens on port 22, the only port the ruleset permits)
+  listens on port 22, the only port its SSH rule permits), and if so whether
+  to allow SSH in (default yes) and which additional TCP and UDP ports to
+  allow in (default none)
 - whether to harden the kernel command line (default no)
 - whether unattended-upgrades may reboot automatically at 03:00
 - journald `SystemMaxUse` and `MaxRetentionSec` (defaults 16G and 30day)
@@ -56,11 +58,12 @@ It asks a few questions up front and then runs unattended:
    key added to that system group. If no non-root user holds the key this step
    warns and is skipped unless confirmed, so I cannot lock myself out.
 7. Optionally installs nftables with `/etc/nftables.conf`: input and forward
-   drop by default, established and related traffic, loopback, ICMP and ICMPv6
-   are accepted, and new SSH connections are rate limited to 3 per minute per
-   source address. `/etc/modules-load.d/firewall.conf` loads the nftables
-   modules at boot so the ruleset can be reloaded after module loading is
-   locked.
+   drop by default; established and related traffic, loopback, ICMP and ICMPv6
+   are accepted, as are new connections to the chosen TCP ports and packets to
+   the chosen UDP ports, and new SSH connections, when allowed, are rate
+   limited to 3 per minute per source address. `/etc/modules-load.d/firewall.conf`
+   loads the nftables modules at boot so the ruleset can be reloaded after
+   module loading is locked.
 8. Optionally installs `/etc/default/grub.d/00-baseline.cfg`, which appends
    `mitigations=auto lockdown=confidentiality randomize_kstack_offset=on
    init_on_alloc=1 slab_nomerge apparmor=1 page_alloc.shuffle=1 debugfs=off`

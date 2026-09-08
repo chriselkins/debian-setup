@@ -55,6 +55,24 @@ ask_yn() {
   done
 }
 
+# ask_ports PROMPT: print the port numbers typed, space separated, or nothing
+# if the user just hits Enter, asking again while any of them is not a port.
+ask_ports() {
+  local reply ports port
+  while true; do
+    read -r -p "$1 (space separated, Enter for none): " reply || true
+    read -r -a ports <<<"${reply//,/ }"
+    for port in "${ports[@]}"; do
+      if [[ ! $port =~ ^[1-9][0-9]{0,4}$ || $port -gt 65535 ]]; then
+        warn "'$port' is not a port number (1-65535)"
+        continue 2
+      fi
+    done
+    printf '%s\n' "${ports[*]}"
+    return
+  done
+}
+
 # install_file PATH MODE, with the content on stdin. Writes the file only when
 # its content differs. Returns 0 if written and 1 if it was already up to date,
 # so the caller can decide whether a service needs reloading.
@@ -126,8 +144,9 @@ validate_ssh_key() {
   fi
 }
 
-# The firewall permits only port 22, so it would lock me out of an sshd that
-# listens elsewhere. Check Port and the per-address ListenAddress overrides.
+# The firewall's SSH rule permits only port 22, so it would lock me out of an
+# sshd that listens elsewhere. Check Port and the per-address ListenAddress
+# overrides.
 sshd_listens_only_on_22() {
   local config directive value found=n
   if ! config=$(sshd -T); then
@@ -217,9 +236,21 @@ gather_answers() {
   # Without sshd installed yet, step_packages installs it on the default port.
   INSTALL_FIREWALL=n
   if ! command -v sshd >/dev/null || sshd_listens_only_on_22; then
-    INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows SSH and ICMP in, drops everything else)" n)
+    INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows ICMP and the ports you choose in, drops everything else)" n)
   else
     warn "skipping the nftables firewall, which would lock you out"
+  fi
+  FIREWALL_SSH=n
+  FIREWALL_TCP_PORTS=''
+  FIREWALL_UDP_PORTS=''
+  if [[ $INSTALL_FIREWALL == y ]]; then
+    FIREWALL_SSH=$(ask_yn "Allow SSH in? (port 22, 3 new connections per minute per source address)" y)
+    while true; do
+      FIREWALL_TCP_PORTS=$(ask_ports "Additional TCP ports to allow in")
+      [[ " $FIREWALL_TCP_PORTS " != *' 22 '* ]] && break
+      warn "port 22 is SSH, which the previous question covers"
+    done
+    FIREWALL_UDP_PORTS=$(ask_ports "Additional UDP ports to allow in")
   fi
 
   HARDEN_BOOTLINE=$(ask_yn "Harden the kernel command line? (lockdown=confidentiality, init_on_alloc, slab_nomerge, ...)" n)
@@ -493,6 +524,75 @@ EOF
   fi
 }
 
+# nft_ports LIST: the space-separated ports as an nft port match, a set when
+# there is more than one.
+nft_ports() {
+  if [[ $1 == *' '* ]]; then printf '{ %s }' "${1// /, }"; else printf '%s' "$1"; fi
+}
+
+# The ruleset for the answers gathered up front, on stdout.
+firewall_ruleset() {
+  cat <<'EOF'
+#!/usr/sbin/nft -f
+# Managed by debian-setup; local edits are overwritten on the next run.
+
+flush ruleset
+
+table inet filter {
+EOF
+  if [[ $FIREWALL_SSH == y ]]; then
+    cat <<'EOF'
+	# New SSH connections per source address, refreshed on every attempt.
+	set ssh_ratelimit {
+		type ipv4_addr
+		flags dynamic
+		timeout 60s
+	}
+	set ssh_ratelimit6 {
+		type ipv6_addr
+		flags dynamic
+		timeout 60s
+	}
+
+EOF
+  fi
+  cat <<'EOF'
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		ct state vmap { established : accept, related : accept, invalid : drop }
+		iifname "lo" accept
+
+		ip protocol icmp accept
+		meta l4proto ipv6-icmp accept
+
+EOF
+  if [[ -n $FIREWALL_TCP_PORTS ]]; then
+    printf '\t\ttcp dport %s ct state new accept\n' "$(nft_ports "$FIREWALL_TCP_PORTS")"
+  fi
+  if [[ -n $FIREWALL_UDP_PORTS ]]; then
+    printf '\t\tudp dport %s accept\n' "$(nft_ports "$FIREWALL_UDP_PORTS")"
+  fi
+  if [[ $FIREWALL_SSH == y ]]; then
+    cat <<'EOF'
+		tcp dport 22 ct state new update @ssh_ratelimit { ip saddr limit rate 3/minute } accept
+		tcp dport 22 ct state new update @ssh_ratelimit6 { ip6 saddr limit rate 3/minute } accept
+EOF
+  fi
+  cat <<'EOF'
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}
+EOF
+}
+
 step_firewall() {
   local changed=n
   log "Configuring the nftables firewall"
@@ -506,47 +606,7 @@ nf_conntrack
 nft_ct
 nft_limit
 EOF
-  install_file /etc/nftables.conf 0755 <<'EOF' && changed=y
-#!/usr/sbin/nft -f
-# Managed by debian-setup; local edits are overwritten on the next run.
-
-flush ruleset
-
-table inet filter {
-	# New SSH connections per source address, refreshed on every attempt.
-	set ssh_ratelimit {
-		type ipv4_addr
-		flags dynamic
-		timeout 60s
-	}
-	set ssh_ratelimit6 {
-		type ipv6_addr
-		flags dynamic
-		timeout 60s
-	}
-
-	chain input {
-		type filter hook input priority filter; policy drop;
-
-		ct state vmap { established : accept, related : accept, invalid : drop }
-		iifname "lo" accept
-
-		ip protocol icmp accept
-		meta l4proto ipv6-icmp accept
-
-		tcp dport 22 ct state new update @ssh_ratelimit { ip saddr limit rate 3/minute } accept
-		tcp dport 22 ct state new update @ssh_ratelimit6 { ip6 saddr limit rate 3/minute } accept
-	}
-
-	chain forward {
-		type filter hook forward priority filter; policy drop;
-	}
-
-	chain output {
-		type filter hook output priority filter; policy accept;
-	}
-}
-EOF
+  firewall_ruleset | install_file /etc/nftables.conf 0755 && changed=y
   systemctl enable --now nftables
   if [[ $changed == y ]]; then
     systemctl reload nftables
