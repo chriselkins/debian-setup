@@ -660,7 +660,7 @@ EOF
 }
 
 step_fim() {
-  local init_db=n
+  local init_db=n rules_changed=n space_action=syslog
   log "Configuring file integrity monitoring"
   # auditd refuses dir= rules for directories that do not exist, and the AIDE
   # baseline should include them from the start.
@@ -732,7 +732,7 @@ EOF
     fi
     init_db=y
   fi
-  if install_file /etc/audit/rules.d/40-fim.rules 0640 <<'EOF'
+  install_file /etc/audit/rules.d/40-fim.rules 0640 <<'EOF' && rules_changed=y
 # Managed by debian-setup; local edits are overwritten on the next run.
 # File Integrity Monitoring - auditd
 #
@@ -784,15 +784,101 @@ EOF
 
 -a always,exit -F arch=b64 -F path=/var/lib/aide/aide.db -F perm=wa -F key=fim_aidedb
 EOF
-  then
+  install_file /etc/audit/rules.d/50-events.rules 0640 <<'EOF' && rules_changed=y
+# Managed by debian-setup; local edits are overwritten on the next run.
+# Security events - auditd
+#
+# The file watches live in 40-fim.rules. These rules record the events that
+# matter on a server: privilege use, module loading, mounts, tracing and
+# clock changes. Where noted they are limited to logged-in users: auid, the
+# login uid, is set by sshd and login and inherited by sudo and su, while
+# daemons, timers and unattended-upgrades run with it unset, so they add
+# nothing to the log.
+
+# Any use of the 32-bit syscall ABI, which nothing on these servers needs.
+-a always,exit -F arch=b32 -S all -F key=abi32
+
+# Kernel module loading and unloading, possible only during the three minutes
+# after boot before disable-modules.service locks it.
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -F key=modules
+
+# Every command run as root by a logged-in user (sudo, su, root shells).
+-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -F key=rootcmd
+
+# Privilege changes by logged-in users.
+-a always,exit -F arch=b64 -S setuid,setreuid,setresuid,setfsuid,setgid,setregid,setresgid,setfsgid -F auid>=1000 -F auid!=unset -F key=privchange
+
+# Mounts by logged-in users.
+-a always,exit -F arch=b64 -S mount,umount2,fsmount,move_mount,mount_setattr -F auid>=1000 -F auid!=unset -F key=mount
+
+# ptrace, which kernel.yama.ptrace_scope=3 denies, so any attempt is suspect.
+-a always,exit -F arch=b64 -S ptrace -F key=ptrace
+
+# Clock changes. systemd-timesyncd adjusts the clock all day with adjtimex
+# and clock_adjtime, so those two are only recorded for logged-in users.
+-a always,exit -F arch=b64 -S settimeofday,clock_settime -F key=time
+-a always,exit -F arch=b64 -S adjtimex,clock_adjtime -F auid>=1000 -F auid!=unset -F key=time
+EOF
+  install_file /etc/audit/rules.d/99-finalize.rules 0640 <<'EOF' && rules_changed=y
+# Managed by debian-setup; local edits are overwritten on the next run.
+# Make the audit rules immutable until the next boot, as
+# disable-modules.service does for kernel modules. augenrules then refuses
+# to load changed rules, which setup.sh reports instead of failing.
+-e 2
+EOF
+  if [[ $rules_changed == y ]]; then
+    if [[ $(auditctl -s 2>/dev/null | awk '$1 == "enabled" { print $2 }') == 2 ]]; then
+      warn "the audit rules are immutable until reboot, so the changed rules were neither checked nor loaded; they load at the next boot"
     # augenrules merges rules.d into /etc/audit/audit.rules and loads it with
     # auditctl, whose exit status is the only syntax check there is. Rules
     # that do not load would also stop auditd from starting at boot.
-    if ! augenrules --load; then
-      rm -f /etc/audit/rules.d/40-fim.rules
+    elif ! augenrules --load; then
+      rm -f /etc/audit/rules.d/{40-fim,50-events,99-finalize}.rules
       augenrules --load || true
       die "auditd could not load the new rules, so they were removed again"
     fi
+  fi
+  # Debian's auditd.conf with larger logs and the disk space actions changed:
+  # mail (or log) at 10 % free, and at 5 % free or on a full disk drop the
+  # oldest audit log rather than stop writing (SUSPEND) or halt the server.
+  [[ $ENABLE_MAIL == y ]] && space_action=email
+  if install_file /etc/audit/auditd.conf 0640 <<EOF
+# Managed by debian-setup; local edits are overwritten on the next run.
+local_events = yes
+write_logs = yes
+log_file = /var/log/audit/audit.log
+log_group = adm
+log_format = ENRICHED
+flush = INCREMENTAL_ASYNC
+freq = 50
+max_log_file = 50
+num_logs = 10
+priority_boost = 4
+name_format = NONE
+max_log_file_action = ROTATE
+space_left = 10%
+space_left_action = $space_action
+verify_email = yes
+action_mail_acct = root
+admin_space_left = 5%
+admin_space_left_action = rotate
+disk_full_action = rotate
+disk_error_action = syslog
+use_libwrap = yes
+tcp_listen_queue = 5
+tcp_max_per_addr = 1
+tcp_client_max_idle = 0
+transport = TCP
+krb5_principal = auditd
+distribute_network = no
+q_depth = 2000
+overflow_action = SYSLOG
+max_restarts = 10
+plugin_dir = /etc/audit/plugins.d
+end_of_event_timeout = 2
+EOF
+  then
+    auditctl --signal reconfigure || warn "auditd did not reload its configuration"
   fi
   install_file /etc/default/debsums 0644 <<'EOF' || true
 # Managed by debian-setup; local edits are overwritten on the next run.
