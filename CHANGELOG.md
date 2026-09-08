@@ -8,6 +8,8 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-08
+
 ### Fixed
 - Reject SSH keys incompatible with the hardening policy before installing
   them: accept Ed25519, security-key Ed25519 and RSA keys of at least 3072
