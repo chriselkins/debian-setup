@@ -12,7 +12,7 @@
 set -euo pipefail
 
 # Set by release.sh; 0.0.0 means an unreleased checkout.
-VERSION=1.0.0
+VERSION=1.0.1
 
 SSH_KEY='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIFY06TgZyT7svTpIbitLw9x/1Dq85m58jDfwsbsN9wzlAAAABHNzaDo= xinix-yubikey'
 

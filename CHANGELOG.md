@@ -8,6 +8,14 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-07
+
+### Fixed
+- Core dumps are now off at the kernel level too: `kernel.core_pattern` is
+  piped to `/bin/false`. Before, the hard core limit of 0 stopped everyone
+  but root, and the `Storage=none` setting only applies to systemd-coredump,
+  which a stock Debian 13 install does not have.
+
 ## [1.0.0] - 2026-09-07
 
 ### Added
