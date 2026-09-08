@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  get.chriselkins.io: serves setup.sh from a commit pinned here, fronting
+  raw.githubusercontent.com. Deploy with release.sh; must live in us-east-1.
+
+Parameters:
+  HostName:
+    Type: String
+    Default: get.chriselkins.io
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Default: Z05989521VUDR072ZUETZ
+    Description: Route 53 zone that holds the HostName record and the ACM validation record
+  CommitSha:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{40}$'
+    Description: Full commit hash of chriselkins/debian-setup that /setup.sh serves
+  ReleaseTag:
+    Type: String
+    Default: none
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+    Description: The signed tag the commit came from, shown to viewers
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref HostName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref HostName
+          HostedZoneId: !Ref HostedZoneId
+      KeyAlgorithm: EC_prime256v1
+
+  # Only /setup.sh reaches GitHub, and only at the pinned commit. Everything
+  # else is answered here, so this host cannot be used to serve other GitHub
+  # content under my name.
+  Function:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: debian-setup-get
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Rewrite /setup.sh to the pinned commit, answer everything else
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        function handler(event) {
+          var request = event.request;
+          if (request.uri === '/setup.sh') {
+            request.uri = '/chriselkins/debian-setup/${CommitSha}/setup.sh';
+            return request;
+          }
+          var text = { 'content-type': { value: 'text/plain; charset=utf-8' } };
+          if (request.uri === '/') {
+            return {
+              statusCode: 200,
+              statusDescription: 'OK',
+              headers: text,
+              body: 'debian-setup: baseline provisioning for my Debian 13 servers.\n' +
+                'https://github.com/chriselkins/debian-setup\n\n' +
+                'Run as root:\n\n' +
+                '    wget -nv -O - https://${HostName}/setup.sh | bash\n\n' +
+                '/setup.sh is release ${ReleaseTag}, commit ${CommitSha}.\n'
+            };
+          }
+          return { statusCode: 404, statusDescription: 'Not Found', headers: text, body: 'Not found\n' };
+        }
+
+  # Content at a commit hash never changes, so ignore GitHub's short max-age
+  # and keep it for a day. release.sh invalidates the cache anyway.
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: debian-setup-get
+        Comment: Immutable content, nothing but the path in the cache key
+        MinTTL: 86400
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # Tells a viewer what it is getting: curl -sI https://get.chriselkins.io/setup.sh
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: debian-setup-get
+        CustomHeadersConfig:
+          Items:
+            - Header: X-Debian-Setup-Commit
+              Value: !Ref CommitSha
+              Override: true
+            - Header: X-Debian-Setup-Release
+              Value: !Ref ReleaseTag
+              Override: true
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Preload: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'debian-setup install script (${HostName})'
+        Aliases:
+          - !Ref HostName
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: github-raw
+            DomainName: raw.githubusercontent.com
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: github-raw
+          ViewerProtocolPolicy: https-only
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: !Ref CachePolicy
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt Function.FunctionARN
+
+  DnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !Ref HostName
+          Type: A
+          AliasTarget:
+            DNSName: !GetAtt Distribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2
+            EvaluateTargetHealth: false
+        - Name: !Ref HostName
+          Type: AAAA
+          AliasTarget:
+            DNSName: !GetAtt Distribution.DomainName
+            HostedZoneId: Z2FDTNDATAQYW2
+            EvaluateTargetHealth: false
+
+Outputs:
+  Url:
+    Value: !Sub 'https://${HostName}/setup.sh'
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName

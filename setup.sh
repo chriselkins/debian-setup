@@ -4,12 +4,15 @@
 #
 # Bootstrap on a fresh install, as root:
 #
-#   wget -nv -O - https://raw.githubusercontent.com/chriselkins/debian-setup/main/setup.sh | bash
+#   wget -nv -O - https://get.chriselkins.io/setup.sh | bash
 #
 # Every step is idempotent, so re-run it at any time to check a server against
 # the current baseline or to apply additions made to this script.
 
 set -euo pipefail
+
+# Set by release.sh; 0.0.0 means an unreleased checkout.
+VERSION=0.0.0
 
 SSH_KEY='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIFY06TgZyT7svTpIbitLw9x/1Dq85m58jDfwsbsN9wzlAAAABHNzaDo= xinix-yubikey'
 
@@ -940,6 +943,7 @@ finish() {
 }
 
 main() {
+  log "debian-setup v$VERSION"
   preflight
   gather_answers
   step_packages
