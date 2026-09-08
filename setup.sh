@@ -106,6 +106,26 @@ key_holders() {
 
 # --- preflight and questions -------------------------------------------------
 
+# Only accept standalone public keys usable by the hardening policy below.
+# Certificates also depend on their CA and principals, so cannot be checked here.
+validate_ssh_key() {
+  local key=$1 type fingerprint bits
+  read -r type _ <<<"$key"
+  case $type in
+    ssh-ed25519|sk-ssh-ed25519@openssh.com|ssh-rsa) ;;
+    *) warn "use an Ed25519, security-key Ed25519, or RSA public key (at least 3072 bits)"; return 1 ;;
+  esac
+  if ! fingerprint=$(ssh-keygen -l -f - <<<"$key" 2>/dev/null); then
+    warn "expected a valid SSH public key, such as the line in ~/.ssh/id_ed25519.pub"
+    return 1
+  fi
+  read -r bits _ <<<"$fingerprint"
+  if [[ $type == ssh-rsa && $bits -lt 3072 ]]; then
+    warn "RSA keys must be at least 3072 bits for the SSH hardening policy"
+    return 1
+  fi
+}
+
 preflight() {
   [[ $EUID -eq 0 ]] || die "this script must run as root"
   # shellcheck source=/dev/null
@@ -126,8 +146,7 @@ gather_answers() {
 
   while true; do
     SSH_KEY=$(ask "SSH public key to install" "$DEFAULT_SSH_KEY")
-    ssh-keygen -l -f - <<<"$SSH_KEY" >/dev/null 2>&1 && break
-    warn "expected an SSH public key, such as the line in ~/.ssh/id_ed25519.pub"
+    validate_ssh_key "$SSH_KEY" && break
   done
 
   default_users=$(awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1 }' /etc/passwd | paste -sd ' ')

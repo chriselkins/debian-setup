@@ -19,8 +19,9 @@ It asks a few questions up front and then runs unattended:
 
 - whether to download and install Comet Backup (the package then asks for the Comet
   username, password and server URL)
-- the SSH public key to install (Enter keeps mine) and which users get it
-  (defaults to the regular users on the box)
+- the SSH public key to install (Enter keeps mine; Ed25519, security-key Ed25519
+  or RSA of at least 3072 bits, as sshd is configured to accept) and which users
+  get it (defaults to the regular users on the box)
 - whether to restrict SSH logins to the `ssh-users` group, listing who will be
   in it (default yes), and whether to allow SSH TCP port forwarding (default no)
 - whether to enable the nftables firewall (default no)
