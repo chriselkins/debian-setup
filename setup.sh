@@ -145,6 +145,22 @@ gather_answers() {
     APPLY_SSHD=$(ask_yn "Apply the sshd hardening anyway?" n)
   fi
 
+  # Everyone who holds or receives the key goes into the ssh-users group, so
+  # AllowGroups cannot lock me out. Without members the restriction is skipped.
+  SSH_GROUP_USERS=()
+  for user in "${holders[@]}" "${KEY_USERS[@]}"; do
+    [[ $user == root ]] && continue
+    [[ " ${SSH_GROUP_USERS[*]} " == *" $user "* ]] || SSH_GROUP_USERS+=("$user")
+  done
+  RESTRICT_SSH=n
+  SSH_TCP_FORWARDING=n
+  if [[ $APPLY_SSHD == y ]]; then
+    if [[ ${#SSH_GROUP_USERS[@]} -gt 0 ]]; then
+      RESTRICT_SSH=$(ask_yn "Restrict SSH logins to the ssh-users group? (members: ${SSH_GROUP_USERS[*]})" y)
+    fi
+    SSH_TCP_FORWARDING=$(ask_yn "Allow SSH TCP port forwarding (tunnels)?" n)
+  fi
+
   INSTALL_FIREWALL=$(ask_yn "Enable the nftables firewall? (allows SSH and ICMP in, drops everything else)" n)
 
   HARDEN_BOOTLINE=$(ask_yn "Harden the kernel command line? (lockdown=confidentiality, init_on_alloc, slab_nomerge, ...)" n)
@@ -358,13 +374,25 @@ step_ssh_keys() {
 }
 
 step_sshd() {
+  local user tcp=no
   log "Hardening sshd"
   if [[ ! -f /etc/ssh/ssh_host_ed25519_key ]]; then
     ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ""
   fi
+  if [[ $RESTRICT_SSH == y ]]; then
+    getent group ssh-users >/dev/null || groupadd --system ssh-users
+    for user in "${SSH_GROUP_USERS[@]}"; do
+      if [[ " $(id -nG "$user") " != *" ssh-users "* ]]; then
+        usermod -aG ssh-users "$user"
+        echo "added $user to ssh-users"
+      fi
+    done
+  fi
+  [[ $SSH_TCP_FORWARDING == y ]] && tcp=yes
   # sshd keeps the first value it reads, so a lower-numbered file can override
   # this baseline.
-  if install_file /etc/ssh/sshd_config.d/99-hardening.conf 0644 <<'EOF'
+  if {
+    cat <<EOF
 # Managed by debian-setup; local edits are overwritten on the next run.
 PermitRootLogin no
 PasswordAuthentication no
@@ -372,10 +400,17 @@ KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 X11Forwarding no
 PermitTunnel no
+AllowAgentForwarding no
+AllowTcpForwarding $tcp
 PubkeyAuthentication yes
 AuthenticationMethods publickey
 LoginGraceTime 30
 MaxAuthTries 3
+# VERBOSE logs the fingerprint of the key that logged in.
+LogLevel VERBOSE
+# Drop sessions whose client has stopped answering for ten minutes.
+ClientAliveInterval 300
+ClientAliveCountMax 2
 KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512,sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,gss-curve25519-sha256-
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com
@@ -386,6 +421,10 @@ GSSAPIKexAlgorithms gss-curve25519-sha256-
 HostbasedAcceptedAlgorithms sk-ssh-ed25519-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-256
 PubkeyAcceptedAlgorithms sk-ssh-ed25519-cert-v01@openssh.com,ssh-ed25519-cert-v01@openssh.com,sk-ssh-ed25519@openssh.com,ssh-ed25519,rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-256
 EOF
+    if [[ $RESTRICT_SSH == y ]]; then
+      echo "AllowGroups ssh-users"
+    fi
+  } | install_file /etc/ssh/sshd_config.d/99-hardening.conf 0644
   then
     if ! sshd -t; then
       rm -f /etc/ssh/sshd_config.d/99-hardening.conf
