@@ -8,6 +8,8 @@ release.sh turns the Unreleased section into the next version.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-07
+
 ### Added
 - setup.sh, the baseline for my Debian 13 servers: package set and full
   upgrade, time sync, optional outgoing mail through msmtp with a daily disk
